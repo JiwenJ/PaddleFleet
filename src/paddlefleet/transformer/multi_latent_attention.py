@@ -146,7 +146,7 @@ class MLASelfAttentionSublayersSpec:
 
     q_a_layernorm: LayerSpec | type = None
     kv_a_layernorm: LayerSpec | type = None
-    rope_rmsnorm: LayerSpec | type = None
+    rope_norm: LayerSpec | type = None
     v_norm: LayerSpec | type = None
 
     q_proj: LayerSpec | type = None
@@ -595,22 +595,22 @@ class MLASelfAttention(MultiLatentAttention):
             config=self.config,
             eps=self.config.rms_norm_eps,
         )
-        # mla qk rope rmsnorm
-        self.use_mla_extra_rmsnorm = getattr(
+        # mla qk rope norm / v norm (optional extra norm)
+        self.use_mla_extra_norm = getattr(
             self.config,
-            "use_mla_extra_rmsnorm",
+            "use_mla_extra_norm",
             False,
         )
 
-        if self.use_mla_extra_rmsnorm:
+        if self.use_mla_extra_norm:
             assert not self.config.apply_rope_fusion, (
-                "use_mla_extra_rmsnorm is not compatible with apply_rope_fusion: "
-                "the fused MLA RoPE kernel bypasses the extra rope_rmsnorm/v_norm "
+                "use_mla_extra_norm is not compatible with apply_rope_fusion: "
+                "the fused MLA RoPE kernel bypasses the extra rope_norm/v_norm "
                 "modules, so their weights would be created but never used in forward."
             )
             # Weighted RMSNorm: learnable scale per channel.
-            self.rope_rmsnorm = build_spec_layer(
-                sublayers_spec.rope_rmsnorm,
+            self.rope_norm = build_spec_layer(
+                sublayers_spec.rope_norm,
                 hidden_size=self.config.qk_rope_head_dim,
                 config=self.config,
                 eps=self.config.rms_norm_eps,
@@ -622,7 +622,7 @@ class MLASelfAttention(MultiLatentAttention):
                 eps=self.config.rms_norm_eps,
             )
         else:
-            self.rope_rmsnorm = None
+            self.rope_norm = None
             self.v_norm = None
 
     def get_query_key_value_tensors(
@@ -879,9 +879,9 @@ class MLASelfAttention(MultiLatentAttention):
                     [self.config.qk_nope_head_dim, self.config.v_head_dim],
                     axis=-1,
                 )
-                if self.use_mla_extra_rmsnorm:
+                if self.use_mla_extra_norm:
                     qk_pe = paddle.cat([q_pos_emb, k_pos_emb], axis=-2)
-                    qk_pe = self.rope_rmsnorm(qk_pe)
+                    qk_pe = self.rope_norm(qk_pe)
                     value = self.v_norm(value)
                     q_pos_emb, k_pos_emb = paddle.split(
                         qk_pe,
