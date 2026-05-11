@@ -196,8 +196,8 @@ def get_attention_spec(
                 o_proj=backend.row_parallel_linear(),
                 q_a_layernorm=qk_norm_standard if use_qk_norm else IdentityOp,
                 kv_a_layernorm=qk_norm_standard if use_qk_norm else IdentityOp,
-                rope_rmsnorm=qk_norm_standard if use_mla_extra_rmsnorm else IdentityOp,
-                v_norm=qk_norm_standard if use_mla_extra_rmsnorm else IdentityOp,
+                rope_rmsnorm=qk_norm_standard if use_mla_extra_rmsnorm else None,
+                v_norm=qk_norm_standard if use_mla_extra_rmsnorm else None,
                 gate_proj=backend.column_parallel_linear()
                 if gated_attention
                 else None,

@@ -603,6 +603,11 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.use_mla_extra_rmsnorm:
+            assert not self.config.apply_rope_fusion, (
+                "use_mla_extra_rmsnorm is not compatible with apply_rope_fusion: "
+                "the fused MLA RoPE kernel bypasses the extra rope_rmsnorm/v_norm "
+                "modules, so their weights would be created but never used in forward."
+            )
             # Weighted RMSNorm: learnable scale per channel.
             self.rope_rmsnorm = build_spec_layer(
                 sublayers_spec.rope_rmsnorm,
