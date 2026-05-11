@@ -146,6 +146,8 @@ class MLASelfAttentionSublayersSpec:
 
     q_a_layernorm: LayerSpec | type = None
     kv_a_layernorm: LayerSpec | type = None
+    rope_rmsnorm: LayerSpec | type = None
+    v_norm: LayerSpec | type = None
 
     q_proj: LayerSpec | type = None
     q_a_proj: LayerSpec | type = None
@@ -331,6 +333,7 @@ class MultiLatentAttention(Attention):
             and self.config.recompute_modules is not None
             and "gated_attn" in self.config.recompute_modules
         )
+
 
     def forward(
         self,
@@ -592,6 +595,30 @@ class MLASelfAttention(MultiLatentAttention):
             config=self.config,
             eps=self.config.rms_norm_eps,
         )
+        # mla qk rope rmsnorm
+        self.use_mla_extra_rmsnorm = getattr(
+            self.config,
+            "use_mla_extra_rmsnorm",
+            False,
+        )
+
+        if self.use_mla_extra_rmsnorm:
+            # Weighted RMSNorm: learnable scale per channel.
+            self.rope_rmsnorm = build_spec_layer(
+                sublayers_spec.rope_rmsnorm,
+                hidden_size=self.config.qk_rope_head_dim,
+                config=self.config,
+                eps=self.config.rms_norm_eps,
+            )
+            self.v_norm = build_spec_layer(
+                sublayers_spec.v_norm,
+                hidden_size=self.config.v_head_dim,
+                config=self.config,
+                eps=self.config.rms_norm_eps,
+            )
+        else:
+            self.rope_rmsnorm = None
+            self.v_norm = None
 
     def get_query_key_value_tensors(
         self,
@@ -847,6 +874,15 @@ class MLASelfAttention(MultiLatentAttention):
                     [self.config.qk_nope_head_dim, self.config.v_head_dim],
                     axis=-1,
                 )
+                if self.use_mla_extra_rmsnorm:
+                    qk_pe = paddle.cat([q_pos_emb, k_pos_emb], axis=-2)
+                    qk_pe = self.rope_rmsnorm(qk_pe)
+                    value = self.v_norm(value)
+                    q_pos_emb, k_pos_emb = paddle.split(
+                        qk_pe,
+                        [self.num_attention_heads_per_partition, 1],
+                        axis=-2,
+                    )
 
                 # When sequence_parallel is enabled and not packed,
                 # q/k are seq-first [s, b, n, d] but rotary_pos_emb is

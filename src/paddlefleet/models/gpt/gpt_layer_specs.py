@@ -131,6 +131,7 @@ def get_attention_spec(
 
     use_qk_norm = getattr(config, "use_qk_norm", False)
     qk_l2_norm = getattr(config, "qk_l2_norm", False)
+    use_mla_extra_rmsnorm = getattr(config, "use_mla_extra_rmsnorm", False)
 
     if attention_layer_type == "self_attention":
         return LayerSpec(
@@ -195,6 +196,8 @@ def get_attention_spec(
                 o_proj=backend.row_parallel_linear(),
                 q_a_layernorm=qk_norm_standard if use_qk_norm else IdentityOp,
                 kv_a_layernorm=qk_norm_standard if use_qk_norm else IdentityOp,
+                rope_rmsnorm=qk_norm_standard if use_mla_extra_rmsnorm else IdentityOp,
+                v_norm=qk_norm_standard if use_mla_extra_rmsnorm else IdentityOp,
                 gate_proj=backend.column_parallel_linear()
                 if gated_attention
                 else None,
