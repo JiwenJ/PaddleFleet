@@ -15,9 +15,158 @@
 # limitations under the License.
 """FP8 Utils"""
 
+import logging
+import os
+from functools import lru_cache
+
 import numpy
 import paddle
 import paddle.nn.functional as F
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_swiglu_clamp_limit():
+    """Read clamp limit from env once. Return None if disabled.
+
+    Cached so that when MOE_SWIGLU_CLAMP_LIMIT is unset/invalid,
+    disabled path is a single attribute load and the behavior is
+    byte-identical to the original (pre-clamp) code path.
+    """
+    val = os.environ.get("MOE_SWIGLU_CLAMP_LIMIT", "")
+    if val == "" or val.lower() == "none":
+        logger.info(
+            f"MOE_SWIGLU_CLAMP_LIMIT is disabled (value: '{val}' or 'none')"
+        )
+        return None
+    try:
+        limit = float(val)
+    except ValueError:
+        logger.info(
+            f"MOE_SWIGLU_CLAMP_LIMIT is disabled (invalid value: '{val}')"
+        )
+        return None
+    if limit <= 0:
+        logger.info(
+            f"MOE_SWIGLU_CLAMP_LIMIT is disabled (non-positive value: {limit})"
+        )
+        return None
+    logger.info(f"MOE_SWIGLU_CLAMP_LIMIT is enabled with value: {limit}")
+    return limit
+
+
+class _ClampMonitor:
+    """全局单例，跨所有 ExpertsGroupGemmContiguousNode 实例共享计数器。
+
+    通过 monkey-patch Trainer.train() 自动注入 callback 来获取 global_step。
+    所有修改仅在本文件内，不改任何库代码。
+    避免在模块加载阶段 import paddleformers.trainer（会触发循环导入）。
+    """
+
+    def __init__(self):
+        self._last_logged_step = -1
+        local_rank = int(
+            os.environ.get(
+                "PADDLE_LOCAL_DEVICE_IDS",
+                os.environ.get("FLAGS_selected_gpus", "0"),
+            )
+        )
+        self._is_rank0 = local_rank == 0
+        self._init_logged = False
+        self._step = 0
+        self._patch_applied = False
+
+    def ensure_patched(self):
+        """通过 sys.modules 懒获取 Trainer 并注入 callback。
+
+        避免直接 import（会触发循环导入）。允许重试直到成功。
+        """
+        if self._patch_applied:
+            return
+        import sys
+
+        trainer_mod = sys.modules.get("paddleformers.trainer")
+        if trainer_mod is None:
+            return
+        cb_mod = sys.modules.get("paddleformers.trainer.trainer_callback")
+        if cb_mod is None:
+            return
+
+        Trainer = getattr(trainer_mod, "Trainer", None)
+        TrainerCallback = getattr(cb_mod, "TrainerCallback", None)
+        if Trainer is None or TrainerCallback is None:
+            return
+
+        self._patch_applied = True
+        monitor = self
+
+        class _ClampStepCB(TrainerCallback):
+            _first_call = True
+
+            def on_step_end(self, args, state, control, **kwargs):
+                monitor._step = state.global_step
+                if _ClampStepCB._first_call:
+                    logger.info(
+                        f"[CLAMP-CB] on_step_end fired, global_step={state.global_step}"
+                    )
+                    _ClampStepCB._first_call = False
+                return control
+
+        # 通过调用栈找到正在运行的 Trainer 实例并直接注入 callback
+        # （此函数在 Trainer.train() -> forward -> _clamp_swiglu_input 中被调用）
+        import inspect
+
+        injected = False
+        for frame_info in inspect.stack():
+            self_var = frame_info[0].f_locals.get("self")
+            if isinstance(self_var, Trainer) and hasattr(
+                self_var, "add_callback"
+            ):
+                self_var.add_callback(_ClampStepCB())
+                logger.info(
+                    "[CLAMP] Injected callback into running Trainer via call stack"
+                )
+                injected = True
+                break
+
+        if not injected:
+            # fallback: 扫描 gc 找 Trainer 实例
+            import gc
+
+            try:
+                for obj in gc.get_objects():
+                    if isinstance(obj, Trainer) and hasattr(
+                        obj, "add_callback"
+                    ):
+                        obj.add_callback(_ClampStepCB())
+                        logger.info(
+                            "[CLAMP] Injected callback into Trainer via gc"
+                        )
+                        injected = True
+                        break
+            except Exception:
+                pass
+
+        if not injected:
+            # 最终 fallback: patch train() 为下次调用准备
+            _orig_train = Trainer.train
+
+            def _patched_train(self_trainer, *args, **kwargs):
+                if not any(
+                    isinstance(cb, _ClampStepCB)
+                    for cb in self_trainer.callback_handler.callbacks
+                ):
+                    self_trainer.add_callback(_ClampStepCB())
+                return _orig_train(self_trainer, *args, **kwargs)
+
+            Trainer.train = _patched_train
+
+        logger.info(f"[CLAMP] Trainer patch applied (injected={injected})")
+
+
+_clamp_monitor = _ClampMonitor()
+
 
 from paddlefleet.fusions.fused_swiglu_scale import (
     fused_swiglu_scale_backward,
@@ -362,6 +511,66 @@ class ExpertsGroupGemmContiguousNode:
         self.is_split_group_gemm = not moe_grouped_gemm
         self.dw_p2p_overlap = dw_p2p_overlap
 
+    def _clamp_swiglu_input(self, o1):
+        """Clamp gate/up before SwiGLU and return (clamped_o1, mask).
+
+        Gate half is clipped from above at +limit, up half is clipped to
+        [-limit, +limit]. mask is 1 where the value was kept, 0 where
+        saturated. Used in both forward (to feed clamped values into the
+        fused SwiGLU/FP8 kernels) and backward (to recompute the same
+        clamped o1 and then multiply do1 by mask, giving the gradient
+        w.r.t. the raw unclamped o1 — mathematically equivalent to
+        embedding clamp into the kernel).
+
+        Returns (o1, None) when clamp is disabled
+        (env MOE_SWIGLU_CLAMP_LIMIT unset / <=0 / 'none').
+        """
+        limit = _get_swiglu_clamp_limit()
+        if limit is None or o1 is None or numpy.prod(o1.shape) == 0:
+            return o1, None
+        _clamp_monitor.ensure_patched()
+        hidden = o1.shape[-1] // 2
+        gate = o1[..., :hidden]
+        up = o1[..., hidden:]
+        mask_gate = (gate <= limit).cast(o1.dtype)
+        mask_up = ((up >= -limit) & (up <= limit)).cast(o1.dtype)
+        mask = paddle.concat([mask_gate, mask_up], axis=-1)
+        clamped = paddle.concat(
+            [
+                paddle.clip(gate, max=limit),
+                paddle.clip(up, min=-limit, max=limit),
+            ],
+            axis=-1,
+        )
+        # --- 在线 clamp 监控（基于真实 optimization step，仅 local_rank 0）---
+        if _clamp_monitor._is_rank0:
+            step = _clamp_monitor._step
+            # 第一次调用必定打 log
+            if not _clamp_monitor._init_logged:
+                num_clamped = int((mask == 0).sum())
+                total = int(mask.numel())
+                gate_max_val = float(gate.max())
+                up_absmax_val = float(up.abs().max())
+                logger.info(
+                    f"[CLAMP-INIT] limit={limit}, gate_max={gate_max_val:.4f}, "
+                    f"up_absmax={up_absmax_val:.4f}, "
+                    f"clamped={num_clamped}/{total} ({num_clamped/total*100:.4f}%)"
+                )
+                _clamp_monitor._init_logged = True
+                _clamp_monitor._last_logged_step = step
+            elif step >= 10 and step % 1 == 0:
+                num_clamped = int((mask == 0).sum())
+                total = int(mask.numel())
+                gate_max_val = float(gate.max())
+                up_absmax_val = float(up.abs().max())
+                logger.info(
+                    f"[CLAMP] step={step}: "
+                    f"clamped {num_clamped}/{total} ({num_clamped/total*100:.4f}%), "
+                    f"gate_max={gate_max_val:.2f}, up_absmax={up_absmax_val:.2f}"
+                )
+                _clamp_monitor._last_logged_step = step
+        return clamped, mask
+
     def cached_tensors(self):
         """
         cached_tensors
@@ -589,6 +798,7 @@ class ExpertsGroupGemmContiguousNode:
         fwd_down_bf16
         """
 
+        o1, _ = self._clamp_swiglu_input(o1)
         o2 = fused_swiglu_scale_forward(o1, unzipped_probs)
 
         if clear_o1:
@@ -676,6 +886,7 @@ class ExpertsGroupGemmContiguousNode:
         w2_scale = w2_scale.reshape([num_expert, -1, w2_scale.shape[-1]])
 
         # TODO:support ue8m0 on SM100
+        o1, _ = self._clamp_swiglu_input(o1)
         o2_fp8, o2_scale = fuse_weighted_swiglu_fp8_quant(
             o1, unzipped_probs, using_pow2_scaling=True, use_ue8m0=False
         )
@@ -758,8 +969,11 @@ class ExpertsGroupGemmContiguousNode:
                 do2_s_shape = [unzipped_grad.shape[0], expert_w2[0].shape[1]]
             do2_s = paddle.empty(do2_s_shape, dtype=unzipped_grad.dtype)
 
+        o1, clamp_mask = self._clamp_swiglu_input(o1)
         o2_s = fused_swiglu_scale_forward(o1, unzipped_probs)
         do1, probs_grad = fused_swiglu_scale_backward(o1, unzipped_probs, do2_s)
+        if clamp_mask is not None:
+            do1 = do1 * clamp_mask
 
         return do1, o2_s, probs_grad
 
@@ -847,6 +1061,9 @@ class ExpertsGroupGemmContiguousNode:
                 )
 
         with paddle.amp.auto_cast(False):
+            # SwiGLU clamp: re-clamp o1 to the same values forward used, and
+            # compute mask so do1 ends up w.r.t. the RAW (pre-clamp) o1.
+            o1, clamp_mask = self._clamp_swiglu_input(o1)
             if USE_INPLACE_SWIGLU_BWD:
                 # inplace，do1 复用 o1 的 GPU buffer（data_ptr 相同）。
                 # del o1 后 do1 仍持有引用，refcount 不归零，物理页不会被 VMM 提前回收。
@@ -866,11 +1083,16 @@ class ExpertsGroupGemmContiguousNode:
                         o1, do2_s, unzipped_probs
                     )
                 )
+            if clamp_mask is not None:
+                do1 = do1 * clamp_mask
 
         return do1, o2_s, probs_grad
 
     def bwd_swiglu(self, o1, do2):
+        o1, clamp_mask = self._clamp_swiglu_input(o1)
         do1, _ = paddle._C_ops.swiglu_grad(o1, None, do2)
+        if clamp_mask is not None:
+            do1 = do1 * clamp_mask
         return do1
 
     def bwd_gate_up_input_bf16(self, do1, expert_w1):
